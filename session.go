@@ -10,9 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
-	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,7 +28,7 @@ import (
 // whole Cassandra cluster.
 //
 // This type extends the Node interface by adding a convinient query builder
-// and automatically sets a default consinstency level on all operations
+// and automatically sets a default consistency level on all operations
 // that do not have a consistency level set.
 type Session struct {
 	cons                Consistency
@@ -57,8 +54,8 @@ type Session struct {
 	control *controlConn
 
 	// event handlers
-	nodeEvents   *eventDeouncer
-	schemaEvents *eventDeouncer
+	nodeEvents   *eventDebouncer
+	schemaEvents *eventDebouncer
 
 	// ring metadata
 	hosts           []HostInfo
@@ -81,18 +78,12 @@ var queryPool = &sync.Pool{
 func addrsToHosts(addrs []string, defaultPort int) ([]*HostInfo, error) {
 	hosts := make([]*HostInfo, len(addrs))
 	for i, hostport := range addrs {
-		// TODO: remove duplication
-		addr, portStr, err := net.SplitHostPort(JoinHostPort(hostport, defaultPort))
+		host, err := hostInfo(hostport, defaultPort)
 		if err != nil {
-			return nil, fmt.Errorf("NewSession: unable to parse hostport of addr %q: %v", hostport, err)
+			return nil, err
 		}
 
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, fmt.Errorf("NewSession: invalid port for hostport of addr %q: %v", hostport, err)
-		}
-
-		hosts[i] = &HostInfo{peer: addr, port: port, state: NodeUp}
+		hosts[i] = host
 	}
 
 	return hosts, nil
@@ -100,7 +91,7 @@ func addrsToHosts(addrs []string, defaultPort int) ([]*HostInfo, error) {
 
 // NewSession wraps an existing Node.
 func NewSession(cfg ClusterConfig) (*Session, error) {
-	//Check that hosts in the ClusterConfig is not empty
+	// Check that hosts in the ClusterConfig is not empty
 	if len(cfg.Hosts) < 1 {
 		return nil, ErrNoHosts
 	}
@@ -111,106 +102,123 @@ func NewSession(cfg ClusterConfig) (*Session, error) {
 		cfg:      cfg,
 		pageSize: cfg.PageSize,
 		stmtsLRU: &preparedLRU{lru: lru.New(cfg.MaxPreparedStmts)},
+		quit:     make(chan struct{}),
 	}
 
-	connCfg, err := connConfig(s)
-	if err != nil {
-		s.Close()
-		return nil, fmt.Errorf("gocql: unable to create session: %v", err)
-	}
-	s.connCfg = connCfg
-
-	s.nodeEvents = newEventDeouncer("NodeEvents", s.handleNodeEvent)
-	s.schemaEvents = newEventDeouncer("SchemaEvents", s.handleSchemaEvent)
+	s.nodeEvents = newEventDebouncer("NodeEvents", s.handleNodeEvent)
+	s.schemaEvents = newEventDebouncer("SchemaEvents", s.handleSchemaEvent)
 
 	s.routingKeyInfoCache.lru = lru.New(cfg.MaxRoutingKeyInfo)
 
-	// I think it might be a good idea to simplify this and make it always discover
-	// hosts, maybe with more filters.
 	s.hostSource = &ringDescriber{
 		session:   s,
 		closeChan: make(chan bool),
 	}
 
-	pool := cfg.PoolConfig.buildPool(s)
 	if cfg.PoolConfig.HostSelectionPolicy == nil {
 		cfg.PoolConfig.HostSelectionPolicy = RoundRobinHostPolicy()
 	}
+	s.pool = cfg.PoolConfig.buildPool(s)
 
-	s.pool = pool
 	s.policy = cfg.PoolConfig.HostSelectionPolicy
 	s.executor = &queryExecutor{
-		pool:   pool,
+		pool:   s.pool,
 		policy: cfg.PoolConfig.HostSelectionPolicy,
 	}
 
-	var hosts []*HostInfo
+	//Check the TLS Config before trying to connect to anything external
+	connCfg, err := connConfig(&s.cfg)
+	if err != nil {
+		//TODO: Return a typed error
+		return nil, fmt.Errorf("gocql: unable to create session: %v", err)
+	}
+	s.connCfg = connCfg
 
-	if !cfg.disableControlConn {
-		s.control = createControlConn(s)
-		if err := s.control.connect(cfg.Hosts); err != nil {
-			s.Close()
+	if err := s.init(); err != nil {
+		s.Close()
+		if err == ErrNoConnectionsStarted {
+			//This error used to be generated inside NewSession & returned directly
+			//Forward it on up to be backwards compatible
+			return nil, ErrNoConnectionsStarted
+		} else {
+			// TODO(zariel): dont wrap this error in fmt.Errorf, return a typed error
 			return nil, fmt.Errorf("gocql: unable to create session: %v", err)
+		}
+	}
+
+	return s, nil
+}
+
+func (s *Session) init() error {
+	hosts, err := addrsToHosts(s.cfg.Hosts, s.cfg.Port)
+	if err != nil {
+		return err
+	}
+
+	if !s.cfg.disableControlConn {
+		s.control = createControlConn(s)
+		if s.cfg.ProtoVersion == 0 {
+			proto, err := s.control.discoverProtocol(hosts)
+			if err != nil {
+				return fmt.Errorf("unable to discover protocol version: %v", err)
+			} else if proto == 0 {
+				return errors.New("unable to discovery protocol version")
+			}
+
+			// TODO(zariel): we really only need this in 1 place
+			s.cfg.ProtoVersion = proto
+			s.connCfg.ProtoVersion = proto
+		}
+
+		if err := s.control.connect(hosts); err != nil {
+			return err
 		}
 
 		// need to setup host source to check for broadcast_address in system.local
 		localHasRPCAddr, _ := checkSystemLocal(s.control)
 		s.hostSource.localHasRpcAddr = localHasRPCAddr
 
-		var err error
-		if cfg.DisableInitialHostLookup {
-			// TODO: we could look at system.local to get token and other metadata
-			// in this case.
-			hosts, err = addrsToHosts(cfg.Hosts, cfg.Port)
-		} else {
-			hosts, _, err = s.hostSource.GetHosts()
+		if !s.cfg.DisableInitialHostLookup {
+			// TODO(zariel): we need to get the partitioner from here
+			var p string
+			hosts, p, err = s.hostSource.GetHosts()
+			if err != nil {
+				return err
+			}
+			s.policy.SetPartitioner(p)
 		}
-
-		if err != nil {
-			s.Close()
-			return nil, fmt.Errorf("gocql: unable to create session: %v", err)
-		}
-	} else {
-		// we dont get host info
-		hosts, err = addrsToHosts(cfg.Hosts, cfg.Port)
 	}
 
 	for _, host := range hosts {
 		if s.cfg.HostFilter == nil || s.cfg.HostFilter.Accept(host) {
-			if existingHost, ok := s.ring.addHostIfMissing(host); ok {
-				existingHost.update(host)
-			}
-
-			s.handleNodeUp(net.ParseIP(host.Peer()), host.Port(), false)
+			host = s.ring.addOrUpdate(host)
+			s.handleNodeUp(host.Peer(), host.Port(), false)
 		}
-	}
-
-	s.quit = make(chan struct{})
-
-	if cfg.ReconnectInterval > 0 {
-		go s.reconnectDownedHosts(cfg.ReconnectInterval)
 	}
 
 	// TODO(zariel): we probably dont need this any more as we verify that we
 	// can connect to one of the endpoints supplied by using the control conn.
 	// See if there are any connections in the pool
-	if s.pool.Size() == 0 {
-		s.Close()
-		return nil, ErrNoConnectionsStarted
+	if s.cfg.ReconnectInterval > 0 {
+		go s.reconnectDownedHosts(s.cfg.ReconnectInterval)
 	}
 
 	// If we disable the initial host lookup, we need to still check if the
 	// cluster is using the newer system schema or not... however, if control
 	// connection is disable, we really have no choice, so we just make our
 	// best guess...
-	if !cfg.disableControlConn && cfg.DisableInitialHostLookup {
+	if !s.cfg.disableControlConn && s.cfg.DisableInitialHostLookup {
 		newer, _ := checkSystemSchema(s.control)
 		s.useSystemSchema = newer
 	} else {
 		s.useSystemSchema = hosts[0].Version().Major >= 3
 	}
 
-	return s, nil
+	if s.pool.Size() == 0 {
+		return ErrNoConnectionsStarted
+	}
+
+	return nil
 }
 
 func (s *Session) reconnectDownedHosts(intv time.Duration) {
@@ -226,16 +234,16 @@ func (s *Session) reconnectDownedHosts(intv time.Duration) {
 			if gocqlDebug {
 				buf := bytes.NewBufferString("Session.ring:")
 				for _, h := range hosts {
-					buf.WriteString("[" + h.Peer() + ":" + h.State().String() + "]")
+					buf.WriteString("[" + h.Peer().String() + ":" + h.State().String() + "]")
 				}
-				log.Println(buf.String())
+				Logger.Println(buf.String())
 			}
 
 			for _, h := range hosts {
 				if h.IsUp() {
 					continue
 				}
-				s.handleNodeUp(net.ParseIP(h.Peer()), h.Port(), true)
+				s.handleNodeUp(h.Peer(), h.Port(), true)
 			}
 		case <-s.quit:
 			return
@@ -381,7 +389,7 @@ func (s *Session) executeQuery(qry *Query) *Iter {
 	return iter
 }
 
-// KeyspaceMetadata returns the schema metadata for the keyspace specified.
+// KeyspaceMetadata returns the schema metadata for the keyspace specified. Returns an error if the keyspace does not exist.
 func (s *Session) KeyspaceMetadata(keyspace string) (*KeyspaceMetadata, error) {
 	// fail fast
 	if s.Closed() {
@@ -410,7 +418,7 @@ func (s *Session) getConn() *Conn {
 			continue
 		}
 
-		pool, ok := s.pool.getPool(host.Peer())
+		pool, ok := s.pool.getPool(host)
 		if !ok {
 			continue
 		}
@@ -432,7 +440,7 @@ func (s *Session) routingKeyInfo(ctx context.Context, stmt string) (*routingKeyI
 	if cached {
 		// done accessing the cache
 		s.routingKeyInfoCache.mu.Unlock()
-		// the entry is an inflight struct similiar to that used by
+		// the entry is an inflight struct similar to that used by
 		// Conn to prepare statements
 		inflight := entry.(*inflightCachedEntry)
 
@@ -463,7 +471,7 @@ func (s *Session) routingKeyInfo(ctx context.Context, stmt string) (*routingKeyI
 	conn := s.getConn()
 	if conn == nil {
 		// TODO: better error?
-		inflight.err = errors.New("gocql: unable to fetch preapred info: no connection avilable")
+		inflight.err = errors.New("gocql: unable to fetch prepared info: no connection available")
 		return nil, inflight.err
 	}
 
@@ -629,8 +637,8 @@ func (s *Session) MapExecuteBatchCAS(batch *Batch, dest map[string]interface{}) 
 	return applied, iter, iter.err
 }
 
-func (s *Session) connect(addr string, errorHandler ConnErrorHandler, host *HostInfo) (*Conn, error) {
-	return Connect(host, addr, s.connCfg, errorHandler, s)
+func (s *Session) connect(host *HostInfo, errorHandler ConnErrorHandler) (*Conn, error) {
+	return Connect(host, s.connCfg, errorHandler, s)
 }
 
 // Query represents a CQL statement that can be executed.
@@ -1014,6 +1022,7 @@ func (q *Query) reset() {
 	q.defaultTimestamp = false
 	q.disableSkipMetadata = false
 	q.disableAutoPage = false
+	q.context = nil
 }
 
 // Iter represents an iterator that can be used to iterate over all rows that
@@ -1039,6 +1048,128 @@ func (iter *Iter) Host() *HostInfo {
 // Columns returns the name and type of the selected columns.
 func (iter *Iter) Columns() []ColumnInfo {
 	return iter.meta.columns
+}
+
+type Scanner interface {
+	Next() bool
+	Scan(...interface{}) error
+	Err() error
+}
+
+type iterScanner struct {
+	iter *Iter
+	cols [][]byte
+}
+
+// Next advances the row pointer to point at the next row, the row is valid until
+// the next call of Next. It returns true if there is a row which is available to be
+// scanned into with Scan.
+// Next must be called before every call to Scan.
+func (is *iterScanner) Next() bool {
+	iter := is.iter
+	if iter.err != nil {
+		return false
+	}
+
+	if iter.pos >= iter.numRows {
+		if iter.next != nil {
+			is.iter = iter.next.fetch()
+			return is.Next()
+		}
+		return false
+	}
+
+	cols := make([][]byte, len(iter.meta.columns))
+	for i := 0; i < len(cols); i++ {
+		col, err := iter.readColumn()
+		if err != nil {
+			iter.err = err
+			return false
+		}
+		cols[i] = col
+	}
+	is.cols = cols
+	iter.pos++
+
+	return true
+}
+
+func scanColumn(p []byte, col ColumnInfo, dest []interface{}) (int, error) {
+	if dest[0] == nil {
+		return 1, nil
+	}
+
+	if col.TypeInfo.Type() == TypeTuple {
+		// this will panic, actually a bug, please report
+		tuple := col.TypeInfo.(TupleTypeInfo)
+
+		count := len(tuple.Elems)
+		// here we pass in a slice of the struct which has the number number of
+		// values as elements in the tuple
+		if err := Unmarshal(col.TypeInfo, p, dest[:count]); err != nil {
+			return 0, err
+		}
+		return count, nil
+	} else {
+		if err := Unmarshal(col.TypeInfo, p, dest[0]); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+}
+
+// Scan copies the current row's columns into dest. If the length of dest does not equal
+// the number of columns returned in the row an error is returned. If an error is encountered
+// when unmarshalling a column into the value in dest an error is returned and the row is invalidated
+// until the next call to Next.
+// Next must be called before calling Scan, if it is not an error is returned.
+func (is *iterScanner) Scan(dest ...interface{}) error {
+	if is.cols == nil {
+		return errors.New("gocql: Scan called without calling Next")
+	}
+
+	iter := is.iter
+	// currently only support scanning into an expand tuple, such that its the same
+	// as scanning in more values from a single column
+	if len(dest) != iter.meta.actualColCount {
+		return fmt.Errorf("gocql: not enough columns to scan into: have %d want %d", len(dest), iter.meta.actualColCount)
+	}
+
+	// i is the current position in dest, could posible replace it and just use
+	// slices of dest
+	i := 0
+	var err error
+	for _, col := range iter.meta.columns {
+		var n int
+		n, err = scanColumn(is.cols[i], col, dest[i:])
+		if err != nil {
+			break
+		}
+		i += n
+	}
+
+	is.cols = nil
+
+	return err
+}
+
+// Err returns the if there was one during iteration that resulted in iteration being unable to complete.
+// Err will also release resources held by the iterator and should not used after being called.
+func (is *iterScanner) Err() error {
+	iter := is.iter
+	is.iter = nil
+	is.cols = nil
+	return iter.Close()
+}
+
+// Scanner returns a row Scanner which provides an interface to scan rows in a manner which is
+// similar to database/sql. The iter should NOT be used again after calling this method.
+func (iter *Iter) Scanner() Scanner {
+	if iter == nil {
+		return nil
+	}
+
+	return &iterScanner{iter: iter}
 }
 
 func (iter *Iter) readColumn() ([]byte, error) {
@@ -1080,37 +1211,19 @@ func (iter *Iter) Scan(dest ...interface{}) bool {
 	// i is the current position in dest, could posible replace it and just use
 	// slices of dest
 	i := 0
-	for c := range iter.meta.columns {
-		col := &iter.meta.columns[c]
+	for _, col := range iter.meta.columns {
 		colBytes, err := iter.readColumn()
 		if err != nil {
 			iter.err = err
 			return false
 		}
 
-		if dest[i] == nil {
-			i++
-			continue
-		}
-
-		switch col.TypeInfo.Type() {
-		case TypeTuple:
-			// this will panic, actually a bug, please report
-			tuple := col.TypeInfo.(TupleTypeInfo)
-
-			count := len(tuple.Elems)
-			// here we pass in a slice of the struct which has the number number of
-			// values as elements in the tuple
-			iter.err = Unmarshal(col.TypeInfo, colBytes, dest[i:i+count])
-			i += count
-		default:
-			iter.err = Unmarshal(col.TypeInfo, colBytes, dest[i])
-			i++
-		}
-
-		if iter.err != nil {
+		n, err := scanColumn(colBytes, col, dest[i:])
+		if err != nil {
+			iter.err = err
 			return false
 		}
+		i += n
 	}
 
 	iter.pos++
@@ -1126,6 +1239,16 @@ func (iter *Iter) Scan(dest ...interface{}) bool {
 // See https://datastax.github.io/java-driver/manual/custom_payloads/
 func (iter *Iter) GetCustomPayload() map[string][]byte {
 	return iter.framer.header.customPayload
+}
+
+// Warnings returns any warnings generated if given in the response from Cassandra.
+//
+// This is only available starting with CQL Protocol v4.
+func (iter *Iter) Warnings() []string {
+	if iter.framer != nil {
+		return iter.framer.header.warnings
+	}
+	return nil
 }
 
 // Close closes the iterator and returns any errors that happened during
@@ -1448,15 +1571,16 @@ func (e Error) Error() string {
 }
 
 var (
-	ErrNotFound      = errors.New("not found")
-	ErrUnavailable   = errors.New("unavailable")
-	ErrUnsupported   = errors.New("feature not supported")
-	ErrTooManyStmts  = errors.New("too many statements")
-	ErrUseStmt       = errors.New("use statements aren't supported. Please see https://github.com/gocql/gocql for explaination.")
-	ErrSessionClosed = errors.New("session has been closed")
-	ErrNoConnections = errors.New("qocql: no hosts available in the pool")
-	ErrNoKeyspace    = errors.New("no keyspace provided")
-	ErrNoMetadata    = errors.New("no metadata available")
+	ErrNotFound             = errors.New("not found")
+	ErrUnavailable          = errors.New("unavailable")
+	ErrUnsupported          = errors.New("feature not supported")
+	ErrTooManyStmts         = errors.New("too many statements")
+	ErrUseStmt              = errors.New("use statements aren't supported. Please see https://github.com/gocql/gocql for explanation.")
+	ErrSessionClosed        = errors.New("session has been closed")
+	ErrNoConnections        = errors.New("gocql: no hosts available in the pool")
+	ErrNoKeyspace           = errors.New("no keyspace provided")
+	ErrKeyspaceDoesNotExist = errors.New("keyspace does not exist")
+	ErrNoMetadata           = errors.New("no metadata available")
 )
 
 type ErrProtocol struct{ error }

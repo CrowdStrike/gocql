@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"runtime"
 	"strings"
@@ -276,6 +275,7 @@ type frameHeader struct {
 	op            frameOp
 	length        int
 	customPayload map[string][]byte
+	warnings      []string
 }
 
 func (f frameHeader) String() string {
@@ -365,7 +365,7 @@ func readHeader(r io.Reader, p []byte) (head frameHeader, err error) {
 	version := p[0] & protoVersionMask
 
 	if version < protoVersion1 || version > protoVersion4 {
-		return frameHeader{}, fmt.Errorf("gocql: unsupported response version: %d", version)
+		return frameHeader{}, fmt.Errorf("gocql: unsupported protocol response version: %d", version)
 	}
 
 	headSize := 9
@@ -469,11 +469,7 @@ func (f *framer) parseFrame() (frame frame, err error) {
 	}
 
 	if f.header.flags&flagWarning == flagWarning {
-		warnings := f.readStringList()
-		// what to do with warnings?
-		for _, v := range warnings {
-			log.Println(v)
-		}
+		f.header.warnings = f.readStringList()
 	}
 
 	if f.header.flags&flagCustomPayload == flagCustomPayload {
@@ -562,7 +558,7 @@ func (f *framer) parseErrorFrame() frame {
 		stmtId := f.readShortBytes()
 		return &RequestErrUnprepared{
 			errorFrame:  errD,
-			StatementId: copyBytes(stmtId), // defensivly copy
+			StatementId: copyBytes(stmtId), // defensively copy
 		}
 	case errReadFailure:
 		res := &RequestErrReadFailure{
