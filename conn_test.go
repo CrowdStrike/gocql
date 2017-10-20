@@ -6,6 +6,7 @@
 package gocql
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -17,8 +18,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/net/context"
 )
 
 const (
@@ -29,6 +28,7 @@ func TestApprove(t *testing.T) {
 	tests := map[bool]bool{
 		approve("org.apache.cassandra.auth.PasswordAuthenticator"):          true,
 		approve("com.instaclustr.cassandra.auth.SharedSecretAuthenticator"): true,
+		approve("com.datastax.bdp.cassandra.auth.DseAuthenticator"):         true,
 		approve("com.apache.cassandra.auth.FakeAuthenticator"):              false,
 	}
 	for k, v := range tests {
@@ -138,6 +138,62 @@ func TestClosed(t *testing.T) {
 
 func newTestSession(addr string, proto protoVersion) (*Session, error) {
 	return testCluster(addr, proto).CreateSession()
+}
+
+func TestDNSLookupConnected(t *testing.T) {
+	log := &testLogger{}
+	Logger = log
+	defer func() {
+		Logger = &defaultLogger{}
+	}()
+
+	srv := NewTestServer(t, defaultProto, context.Background())
+	defer srv.Stop()
+
+	cluster := NewCluster("cassandra1.invalid", srv.Address, "cassandra2.invalid")
+	cluster.ProtoVersion = int(defaultProto)
+	cluster.disableControlConn = true
+
+	// CreateSession() should attempt to resolve the DNS name "cassandraX.invalid"
+	// and fail, but continue to connect via srv.Address
+	_, err := cluster.CreateSession()
+	if err != nil {
+		t.Fatal("CreateSession() should have connected")
+	}
+
+	if !strings.Contains(log.String(), "gocql: dns error") {
+		t.Fatalf("Expected to receive dns error log message  - got '%s' instead", log.String())
+	}
+}
+
+func TestDNSLookupError(t *testing.T) {
+	log := &testLogger{}
+	Logger = log
+	defer func() {
+		Logger = &defaultLogger{}
+	}()
+
+	srv := NewTestServer(t, defaultProto, context.Background())
+	defer srv.Stop()
+
+	cluster := NewCluster("cassandra1.invalid", "cassandra2.invalid")
+	cluster.ProtoVersion = int(defaultProto)
+	cluster.disableControlConn = true
+
+	// CreateSession() should attempt to resolve each DNS name "cassandraX.invalid"
+	// and fail since it could not resolve any dns entries
+	_, err := cluster.CreateSession()
+	if err == nil {
+		t.Fatal("CreateSession() should have returned an error")
+	}
+
+	if !strings.Contains(log.String(), "gocql: dns error") {
+		t.Fatalf("Expected to receive dns error log message  - got '%s' instead", log.String())
+	}
+
+	if err.Error() != "gocql: unable to create session: failed to resolve any of the provided hostnames" {
+		t.Fatalf("Expected CreateSession() to fail with message  - got '%s' instead", err.Error())
+	}
 }
 
 func TestStartupTimeout(t *testing.T) {
@@ -518,7 +574,13 @@ func TestStream0(t *testing.T) {
 		}
 	})
 
-	conn, err := Connect(srv.host(), &ConnConfig{ProtoVersion: int(srv.protocol)}, errorHandler, createTestSession())
+	s, err := srv.session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	conn, err := s.connect(srv.host(), errorHandler)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -553,7 +615,13 @@ func TestConnClosedBlocked(t *testing.T) {
 		t.Log(err)
 	})
 
-	conn, err := Connect(srv.host(), &ConnConfig{ProtoVersion: int(srv.protocol)}, errorHandler, createTestSession())
+	s, err := srv.session()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	conn, err := s.connect(srv.host(), errorHandler)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -681,6 +749,10 @@ type TestServer struct {
 	closed bool
 }
 
+func (srv *TestServer) session() (*Session, error) {
+	return testCluster(srv.Address, protoVersion(srv.protocol)).CreateSession()
+}
+
 func (srv *TestServer) host() *HostInfo {
 	host, err := hostInfo(srv.Address, 9042)
 	if err != nil {
@@ -700,13 +772,7 @@ func (srv *TestServer) closeWatch() {
 
 func (srv *TestServer) serve() {
 	defer srv.listen.Close()
-	for {
-		select {
-		case <-srv.ctx.Done():
-			return
-		default:
-		}
-
+	for !srv.isClosed() {
 		conn, err := srv.listen.Accept()
 		if err != nil {
 			break
@@ -714,26 +780,13 @@ func (srv *TestServer) serve() {
 
 		go func(conn net.Conn) {
 			defer conn.Close()
-			for {
-				select {
-				case <-srv.ctx.Done():
-					return
-				default:
-				}
-
+			for !srv.isClosed() {
 				framer, err := srv.readFrame(conn)
 				if err != nil {
 					if err == io.EOF {
 						return
 					}
-
-					select {
-					case <-srv.ctx.Done():
-						return
-					default:
-					}
-
-					srv.t.Error(err)
+					srv.errorLocked(err)
 					return
 				}
 
@@ -768,16 +821,19 @@ func (srv *TestServer) Stop() {
 	srv.closeLocked()
 }
 
+func (srv *TestServer) errorLocked(err interface{}) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.closed {
+		return
+	}
+	srv.t.Error(err)
+}
+
 func (srv *TestServer) process(f *framer) {
 	head := f.header
 	if head == nil {
-		select {
-		case <-srv.ctx.Done():
-			return
-		default:
-		}
-
-		srv.t.Error("process frame with a nil header")
+		srv.errorLocked("process frame with a nil header")
 		return
 	}
 
@@ -845,13 +901,7 @@ func (srv *TestServer) process(f *framer) {
 	f.wbuf[0] = srv.protocol | 0x80
 
 	if err := f.finishWrite(); err != nil {
-		select {
-		case <-srv.ctx.Done():
-			return
-		default:
-		}
-
-		srv.t.Error(err)
+		srv.errorLocked(err)
 	}
 }
 
